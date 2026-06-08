@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  analyzer:
+    build: .
+    volumes:
+      - ./project_to_analyze:/project:ro
+      - ./output:/output
+    command: ["/project", "-o", "/output/dependency_graph.json", "-e", "/output/failed_files.txt"]
