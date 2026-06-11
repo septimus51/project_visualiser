@@ -32,7 +32,7 @@ A containerized Python tool that analyzes code projects to build a dependency gr
 ### 1. Clone or download the project
 
 ```bash
-git clone &lt;repository-url&gt;
+git clone https://github.com/septimus51/project_visualiser
 cd code-analyzer
 ```
 ### 2. Build the Docker image
