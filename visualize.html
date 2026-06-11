@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Graphe de Dépendances</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body { margin: 0; font-family: sans-serif; background: #1a1a2e; color: #eee; overflow: hidden; }
+        #graph { width: 100vw; height: 100vh; }
+        .node circle { stroke: #fff; stroke-width: 1.5px; cursor: pointer; }
+        .node text { font-size: 10px; fill: #eee; pointer-events: none; }
+        .link { stroke: #888; stroke-opacity: 0.6; }
+        .link.calls { stroke: #e74c3c; stroke-width: 2px; }
+        .link.imports { stroke: #3498db; stroke-width: 1.5px; stroke-dasharray: 5,5; }
+        .link.includes { stroke: #f39c12; stroke-width: 2px; stroke-dasharray: 3,3; }
+        .link.contains { stroke: #2ecc71; stroke-width: 1px; }
+        #info {
+            position: fixed; top: 10px; left: 10px;
+            background: rgba(0,0,0,0.8); padding: 15px;
+            border-radius: 8px; max-width: 400px; font-size: 12px;
+        }
+        #search {
+            position: fixed; top: 10px; right: 10px;
+            padding: 8px; border-radius: 4px; border: none; width: 200px;
+        }
+        .legend {
+            position: fixed; bottom: 10px; left: 10px;
+            background: rgba(0,0,0,0.8); padding: 10px; border-radius: 8px;
+        }
+        .legend span { display: inline-block; width: 20px; height: 3px; margin-right: 8px; }
+    </style>
+</head>
+<body>
+    <div id="graph"></div>
+    <div id="info">
+        <h3>🕸️ Graphe de Dépendances</h3>
+        <p>Survolez un nœud pour voir les détails.<br>Cliquez pour fixer.<br>Double-cliquez pour libérer.<br>Utilisez la molette pour zoomer.</p>
+        <div id="details"></div>
+    </div>
+    <input type="text" id="search" placeholder="Rechercher un fichier ou fonction...">
+    <div class="legend">
+        <div><span style="background:#e74c3c"></span> Appel de fonction</div>
+        <div><span style="background:#3498db"></span> Import (Python/JS/Java...)</div>
+        <div><span style="background:#f39c12"></span> Include C/C++ (#include)</div>
+        <div><span style="background:#2ecc71"></span> Contient (fichier→fonction)</div>
+    </div>
+
+<script>
+fetch('dependency_graph.json')
+    .then(r => r.json())
+    .then(rawData => {
+        // CORRECTION : Créer les nœuds externes manquants
+        const nodeIds = new Set(rawData.nodes.map(n => n.id));
+        const missingNodes = [];
+        
+        rawData.links.forEach(link => {
+            if (!nodeIds.has(link.source)) {
+                missingNodes.push({ id: link.source, type: 'external', name: link.source.replace('external::', '') });
+                nodeIds.add(link.source);
+            }
+            if (!nodeIds.has(link.target)) {
+                missingNodes.push({ id: link.target, type: 'external', name: link.target.replace('external::', '') });
+                nodeIds.add(link.target);
+            }
+        });
+        
+        const data = {
+            nodes: [...rawData.nodes, ...missingNodes],
+            links: rawData.links
+        };
+        
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        
+        const svg = d3.select("#graph").append("svg")
+            .attr("width", width).attr("height", height)
+            .call(d3.zoom().on("zoom", e => g.attr("transform", e.transform)))
+            .append("g");
+        
+        const g = svg.append("g");
+        
+        const colorScale = d3.scaleOrdinal()
+            .domain(["file", "function", "external"])
+            .range(["#f39c12", "#9b59b6", "#e74c3c"]);
+        
+        const langColors = d3.scaleOrdinal(d3.schemeCategory10);
+        
+        const simulation = d3.forceSimulation(data.nodes)
+            .force("link", d3.forceLink(data.links).id(d => d.id).distance(100))
+            .force("charge", d3.forceManyBody().strength(-300))
+            .force("center", d3.forceCenter(width/2, height/2))
+            .force("collision", d3.forceCollide().radius(30));
+        
+        const link = g.append("g").selectAll("line")
+            .data(data.links)
+            .enter().append("line")
+            .attr("class", d => `link ${d.type}`)
+            .attr("stroke-width", d => {
+                if (d.type === 'calls') return 2;
+                if (d.type === 'includes') return 2;
+                return 1;
+            });
+        
+        const node = g.append("g").selectAll(".node")
+            .data(data.nodes)
+            .enter().append("g")
+            .attr("class", "node")
+            .call(d3.drag()
+                .on("start", dragstarted)
+                .on("drag", dragged)
+                .on("end", dragended));
+        
+        node.append("circle")
+            .attr("r", d => d.type === 'file' ? 12 : (d.type === 'external' ? 6 : 8))
+            .attr("fill", d => {
+                if (d.type === 'file') return langColors(d.language || 'unknown');
+                return colorScale(d.type);
+            })
+            .on("mouseover", (e, d) => showDetails(d))
+            .on("click", (e, d) => { d.fx = d.x; d.fy = d.y; })
+            .on("dblclick", (e, d) => { d.fx = null; d.fy = null; });
+        
+        node.append("text")
+            .attr("dx", 14).attr("dy", 4)
+            .text(d => d.type === 'function' ? d.name : (d.id.split('/').pop() || d.id));
+        
+        simulation.on("tick", () => {
+            link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
+                .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+            node.attr("transform", d => `translate(${d.x},${d.y})`);
+        });
+        
+        document.getElementById('search').addEventListener('input', e => {
+            const term = e.target.value.toLowerCase();
+            node.selectAll('circle').attr('opacity', d => {
+                const text = (d.id + (d.name || '') + (d.language || '')).toLowerCase();
+                return text.includes(term) || !term ? 1 : 0.1;
+            });
+            link.attr('opacity', d => {
+                const s = (d.source.id || '').toLowerCase().includes(term);
+                const t = (d.target.id || '').toLowerCase().includes(term);
+                return (s || t || !term) ? 1 : 0.05;
+            });
+        });
+        
+        function showDetails(d) {
+            let html = `<strong>${d.type === 'file' ? '📁' : d.type === 'external' ? '📦' : '⚙️'} ${d.id}</strong><br>`;
+            if (d.type === 'file') {
+                html += `Langage: ${d.language}<br>Fonctions: ${(d.functions || []).length}<br>Classes: ${(d.classes || []).length}`;
+            } else if (d.type === 'function') {
+                html += `Fichier: ${d.file}<br>Lignes: ${d.line_start}-${d.line_end}`;
+            } else if (d.type === 'external') {
+                html += `Bibliothèque externe<br>Non résolue dans le projet`;
+            }
+            const incoming = data.links.filter(l => l.target.id === d.id).length;
+            const outgoing = data.links.filter(l => l.source.id === d.id).length;
+            html += `<br>Entrants: ${incoming} | Sortants: ${outgoing}`;
+            document.getElementById('details').innerHTML = html;
+        }
+        
+        function dragstarted(e, d) { if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; }
+        function dragged(e, d) { d.fx = e.x; d.fy = e.y; }
+        function dragended(e, d) { if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }
+    })
+    .catch(err => {
+        document.body.innerHTML = `<div style="color:red; padding:20px;">
+            <h2>Erreur</h2>
+            <p>${err.message}</p>
+            <pre>${err.stack}</pre>
+        </div>`;
+    });
+</script>
+</body>
+</html>
