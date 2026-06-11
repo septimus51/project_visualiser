@@ -36,6 +36,7 @@ class FileImport:
     is_relative: bool = False
     line: int = 0
     source: str = ""  # La ligne d'import originale
+    is_include: bool = False  # True pour #include C/C++
 
 
 @dataclass
@@ -55,6 +56,7 @@ class FileAnalysis:
     functions: List[FunctionDef] = field(default_factory=list)
     imports: List[FileImport] = field(default_factory=list)
     classes: List[str] = field(default_factory=list)
+    includes: List[FileImport] = field(default_factory=list)  # Spécifique C/C++
     success: bool = True
     error: Optional[str] = None
 
@@ -202,6 +204,157 @@ class PythonASTAnalyzer(ast.NodeVisitor):
         return None
 
 
+class CIncludeAnalyzer:
+    """Analyseur spécialisé pour les #include C/C++."""
+    
+    # Pattern pour #include avec détection du type (<> ou "")
+    INCLUDE_PATTERN = re.compile(
+        r'^\s*#\s*include\s+(<([^>]+)>|"([^"]+)")',
+        re.MULTILINE
+    )
+    
+    # Pattern pour les définitions de fonctions C/C++
+    FUNCTION_PATTERN = re.compile(
+        r'(?:^|\n)\s*(?:inline\s+|static\s+|extern\s+|virtual\s+|'
+        r'[\w\*&:<>,\s]+?\s+)*?'
+        r'(\w+)\s*\([^)]*\)\s*(?:const\s*|override\s*|final\s*|noexcept\s*)*\s*\{',
+        re.MULTILINE
+    )
+    
+    # Pattern pour les appels de fonction C/C++
+    CALL_PATTERN = re.compile(
+        r'(\b\w+\b)\s*\(',
+        re.MULTILINE
+    )
+    
+    # Pattern pour les classes/structs
+    CLASS_PATTERN = re.compile(
+        r'(?:class|struct|enum|union|namespace)\s+(\w+)',
+        re.MULTILINE
+    )
+    
+    def __init__(self, file_path: str, source_code: str, language: str = 'c'):
+        self.file_path = file_path
+        self.source_code = source_code
+        self.language = language
+        self.lines = source_code.split('\n')
+        
+    def analyze(self) -> FileAnalysis:
+        try:
+            includes = self._extract_includes()
+            functions = self._extract_functions()
+            classes = self._extract_classes()
+            
+            return FileAnalysis(
+                path=self.file_path,
+                language=self.language,
+                functions=functions,
+                imports=includes,  # Les includes sont aussi des imports
+                classes=classes,
+                includes=includes,  # Spécifique pour C/C++
+                success=True
+            )
+        except Exception as e:
+            return FileAnalysis(
+                path=self.file_path,
+                language=self.language,
+                success=False,
+                error=str(e)
+            )
+    
+    def _extract_includes(self) -> List[FileImport]:
+        """Extrait les #include avec distinction <> et ""."""
+        includes = []
+        
+        for match in self.INCLUDE_PATTERN.finditer(self.source_code):
+            # match.group(1) = <file> ou "file"
+            # match.group(2) = file sans <> (si <>)
+            # match.group(3) = file sans "" (si "")
+            
+            if match.group(2):  # #include <...> = système
+                include_path = match.group(2)
+                is_system = True
+            else:  # #include "..." = local/projet
+                include_path = match.group(3)
+                is_system = False
+            
+            # Trouver la ligne
+            line_num = self.source_code[:match.start()].count('\n') + 1
+            
+            includes.append(FileImport(
+                module=include_path,
+                names=[include_path],
+                is_relative=not is_system,  # "" = relatif/local, <> = système
+                line=line_num,
+                source=self.lines[line_num - 1].strip() if line_num <= len(self.lines) else f'#include <{include_path}>' if is_system else f'#include "{include_path}"',
+                is_include=True
+            ))
+        
+        return includes
+    
+    def _extract_functions(self) -> List[FunctionDef]:
+        """Extrait les définitions de fonctions C/C++."""
+        functions = []
+        
+        for match in self.FUNCTION_PATTERN.finditer(self.source_code):
+            func_name = match.group(1)
+            # Ignorer les mots-clés C/C++
+            if func_name in ['if', 'while', 'for', 'switch', 'catch', 'return', 
+                            'sizeof', 'new', 'delete', 'static_cast', 'dynamic_cast',
+                            'const_cast', 'reinterpret_cast', 'decltype', 'typeof']:
+                continue
+            
+            line_num = self.source_code[:match.start()].count('\n') + 1
+            
+            # Chercher les appels dans la fonction
+            calls = self._find_calls_in_function(match.start(), match.end())
+            
+            functions.append(FunctionDef(
+                name=func_name,
+                line_start=line_num,
+                line_end=line_num,  # On ne calcule pas la fin exacte ici
+                calls=calls
+            ))
+        
+        return functions
+    
+    def _find_calls_in_function(self, start_pos: int, end_pos: int) -> List[FunctionCall]:
+        """Trouve les appels de fonction dans une fonction donnée."""
+        calls = []
+        func_body = self.source_code[start_pos:end_pos]
+        
+        for match in self.CALL_PATTERN.finditer(func_body):
+            call_name = match.group(1)
+            # Ignorer les mots-clés et les appels évidents
+            if call_name in ['if', 'while', 'for', 'switch', 'catch', 'return',
+                            'sizeof', 'new', 'delete', 'static_cast', 'dynamic_cast',
+                            'const_cast', 'reinterpret_cast']:
+                continue
+            
+            # Calculer la ligne relative au fichier
+            line_offset = self.source_code[:start_pos].count('\n')
+            local_line = func_body[:match.start()].count('\n')
+            absolute_line = line_offset + local_line + 1
+            
+            calls.append(FunctionCall(
+                name=call_name,
+                source_file=self.file_path,
+                source_function=None,  # Sera mis à jour
+                line=absolute_line,
+                column=match.start() - func_body.rfind('\n', 0, match.start()) if '\n' in func_body[:match.start()] else match.start(),
+                is_external=False  # Sera déterminé plus tard
+            ))
+        
+        return calls
+    
+    def _extract_classes(self) -> List[str]:
+        """Extrait les classes/structs/enum/union/namespace."""
+        classes = []
+        for match in self.CLASS_PATTERN.finditer(self.source_code):
+            classes.append(match.group(1))
+        return classes
+
+
 class GenericRegexAnalyzer:
     """Analyseur par regex pour les langages non supportés nativement."""
     
@@ -224,18 +377,6 @@ class GenericRegexAnalyzer:
             'call': r'(\w+(?:\.\w+)*)\s*\(',
             'import': r'import\s+([\w.]+(?:\.\*)?);',
             'class': r'(?:class|interface|enum)\s+(\w+)'
-        },
-        'c': {
-            'function': r'(?:static\s+)?(?:[\w\*]+\s+)+(\w+)\s*\([^)]*\)\s*\{',
-            'call': r'(\w+)\s*\(',
-            'import': r'#include\s*[<"]([^>"]+)[>"]',
-            'class': None
-        },
-        'cpp': {
-            'function': r'(?:[\w\*:<>,\s&]+)\s+(\w+)::(\w+)\s*\([^)]*\)\s*\{|(?:[\w\*:<>,\s&]+)\s+(\w+)\s*\([^)]*\)\s*\{',
-            'call': r'(\w+(?:::\w+)*)\s*\(',
-            'import': r'#include\s*[<"]([^>"]+)[>"]',
-            'class': r'(?:class|struct)\s+(\w+)'
         },
         'go': {
             'function': r'func\s+(?:\(\w+\s+[\w\*]+\)\s+)?(\w+)\s*\([^)]*\)',
@@ -424,6 +565,7 @@ class DependencyGraphBuilder:
         self.failed_files: List[Tuple[str, str]] = []
         self.file_index: Dict[str, FileAnalysis] = {}
         self.function_index: Dict[str, List[str]] = defaultdict(list)  # func_name -> [file_paths]
+        self.include_index: Dict[str, List[str]] = defaultdict(list)  # nom_fichier -> [chemins]
         
     def discover_files(self) -> List[Path]:
         """Découvre tous les fichiers de code du projet."""
@@ -497,6 +639,8 @@ class DependencyGraphBuilder:
         # Analyse selon le langage
         if language == 'python':
             analyzer = PythonASTAnalyzer(rel_path, source_code)
+        elif language in ['c', 'cpp']:
+            analyzer = CIncludeAnalyzer(rel_path, source_code, language)
         else:
             analyzer = GenericRegexAnalyzer(rel_path, source_code, language)
         
@@ -509,10 +653,17 @@ class DependencyGraphBuilder:
     
     def build_graph(self) -> Dict[str, Any]:
         """Construit le graphe JSON final."""
-        # Indexer les fonctions
+        # Indexer les fonctions et les includes
         for analysis in self.analyses:
             for func in analysis.functions:
                 self.function_index[func.name].append(analysis.path)
+            
+            # Indexer les includes C/C++ pour résolution rapide
+            if analysis.language in ['c', 'cpp']:
+                for inc in analysis.includes:
+                    # Indexer par nom de fichier (sans chemin)
+                    file_name = Path(inc.module).name
+                    self.include_index[file_name].append(analysis.path)
         
         # Construire les nœuds et liens
         nodes = []
@@ -565,17 +716,19 @@ class DependencyGraphBuilder:
                             "is_external": call.is_external
                         })
         
-        # Liens d'import entre fichiers
+        # Liens d'import entre fichiers (Python, Java, etc.)
         for analysis in self.analyses:
             for imp in analysis.imports:
                 target_file = self._resolve_import(imp, analysis)
                 if target_file and target_file in file_nodes:
+                    link_type = "includes" if imp.is_include else "imports"
                     links.append({
                         "source": analysis.path,
                         "target": target_file,
-                        "type": "imports",
+                        "type": link_type,
                         "module": imp.module,
-                        "names": imp.names
+                        "names": imp.names,
+                        "is_system": not imp.is_relative if imp.is_include else None
                     })
         
         return {
@@ -633,6 +786,31 @@ class DependencyGraphBuilder:
     
     def _resolve_import(self, imp: FileImport, source_analysis: FileAnalysis) -> Optional[str]:
         """Tente de résoudre un import vers un fichier du projet."""
+        # Pour les includes C/C++ locaux (#include "file.h")
+        if imp.is_include and imp.is_relative:
+            # Chercher dans le même dossier et les sous-dossiers
+            source_dir = Path(source_analysis.path).parent
+            target_name = Path(imp.module).name
+            
+            # Chercher le fichier exact
+            for analysis in self.analyses:
+                if analysis.path.endswith(imp.module) or Path(analysis.path).name == target_name:
+                    return analysis.path
+            
+            # Chercher dans le même dossier
+            candidate = source_dir / imp.module
+            if candidate.exists():
+                return str(candidate.relative_to(self.project_path))
+        
+        # Pour les includes système C/C++ (#include <file.h>)
+        # On ne résout pas les système, mais on pourrait chercher dans le projet
+        if imp.is_include and not imp.is_relative:
+            target_name = Path(imp.module).name
+            for analysis in self.analyses:
+                if Path(analysis.path).name == target_name:
+                    return analysis.path
+        
+        # Pour les imports Python/JS/Java...
         module_path = imp.module.replace('.', '/')
         
         candidates = [
@@ -647,7 +825,7 @@ class DependencyGraphBuilder:
         ]
         
         # Pour les imports relatifs
-        if imp.is_relative:
+        if imp.is_relative and not imp.is_include:
             source_dir = Path(source_analysis.path).parent
             for level in range(1, 5):  # Jusqu'à 4 niveaux de parent
                 if level <= len(source_dir.parts):
